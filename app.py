@@ -772,5 +772,7 @@ def api_download(job_id: str):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=4090, debug=True)
-    # app.run(host="127.0.0.1", port=5000, debug=True)
+    port = int(os.environ.get("PORT", "4090"))
+    # Tắt debug khi deploy (Railway đặt RAILWAY_ENVIRONMENT)
+    debug = os.environ.get("RAILWAY_ENVIRONMENT") is None
+    app.run(host="0.0.0.0", port=port, debug=debug)
