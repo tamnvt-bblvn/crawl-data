@@ -367,6 +367,7 @@ PAGE = """
   var pollTimer = null;
   var maxLog = 120;
   var lastSeenLog = "";
+  var autoDownloadDone = false;
 
   function logLine(text) {
     var d = document.createElement("div");
@@ -415,6 +416,7 @@ PAGE = """
     doneMsg.textContent = "";
     logEl.innerHTML = "";
     lastSeenLog = "";
+    autoDownloadDone = false;
     progressPanel.classList.add("active");
 
     var curl = curlEl.value.trim();
@@ -487,6 +489,8 @@ PAGE = """
           }
           if (p.status === "done") {
             stopPoll();
+            if (autoDownloadDone) return;
+            autoDownloadDone = true;
             btn.disabled = false;
             btn.textContent = "Bắt đầu tải & tạo ZIP";
             setStatus("ok", "Hoàn tất");
