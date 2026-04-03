@@ -1,3 +1,4 @@
+import html
 import os
 import shutil
 import tempfile
@@ -8,6 +9,7 @@ import zipfile
 
 from flask import (
     Flask,
+    Response,
     after_this_request,
     jsonify,
     render_template_string,
@@ -19,6 +21,21 @@ from main import download_resources, parse_curl_command
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
+
+
+def _download_gone_response(message: str, status_code: int = 404) -> Response:
+    """Trả HTML khi ZIP không còn (tránh trình duyệt lưu file .json khi reload / mở lại link)."""
+    safe = html.escape(message, quote=False)
+    body = (
+        "<!DOCTYPE html><html lang=\"vi\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>Tải xuống</title></head><body style=\"font-family:system-ui,sans-serif;"
+        "padding:1.5rem;max-width:36rem\"><p>"
+        + safe
+        + '</p><p><a href="/">← Về trang chủ</a></p></body></html>'
+    )
+    return Response(body, status=status_code, mimetype="text/html; charset=utf-8")
+
 
 jobs_lock = threading.Lock()
 jobs: dict = {}
@@ -394,13 +411,43 @@ PAGE = """
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
 
-  function triggerDownload(jobId) {
-    var a = document.createElement("a");
-    a.href = "/api/download/" + jobId;
-    a.download = "";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+  function triggerDownload(jobId, zipName) {
+    var fallbackName = zipName || "wallpapers.zip";
+    fetch("/api/download/" + jobId)
+      .then(function(r) {
+        if (!r.ok) {
+          return r.text().then(function() {
+            throw new Error(
+              "ZIP chỉ tải được một lần — nếu đã tải hoặc đã reload trang, hãy chạy lại bước tải trên trang chủ."
+            );
+          });
+        }
+        var ct = (r.headers.get("Content-Type") || "").toLowerCase();
+        if (ct.indexOf("zip") === -1 && ct.indexOf("octet-stream") === -1) {
+          throw new Error("Phản hồi không phải file ZIP.");
+        }
+        return r.blob().then(function(blob) { return { blob: blob, disp: r.headers.get("Content-Disposition") }; });
+      })
+      .then(function(x) {
+        var blob = x.blob;
+        var name = fallbackName;
+        var m = /filename\\*=(?:UTF-8'')?([^;]+)|filename="([^"]+)"/i.exec(x.disp || "");
+        if (m) {
+          name = decodeURIComponent((m[1] || m[2] || "").trim().replace(/^"+|"+$/g, "")) || name;
+        }
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      })
+      .catch(function(e) {
+        parseErr.textContent = e.message || String(e);
+        parseErr.style.display = "block";
+      });
   }
 
   clearLogBtn.addEventListener("click", function() {
@@ -516,7 +563,7 @@ PAGE = """
             html += "</ul>";
             doneMsg.innerHTML = html;
             donePanel.classList.add("active");
-            triggerDownload(jobId);
+            triggerDownload(jobId, p.zip_name || "");
           }
         }).catch(function() {});
       }, 400);
@@ -747,13 +794,20 @@ def api_download(job_id: str):
     with jobs_lock:
         job = jobs.get(job_id)
         if not job or job.get("status") != "done":
-            return jsonify({"error": "Chưa sẵn sàng hoặc đã hết hạn."}), 404
+            return _download_gone_response(
+                "Chưa sẵn sàng hoặc link đã hết hạn. "
+                "ZIP chỉ dùng một lần — reload tab hoặc mở lại link sẽ không tải được; hãy về trang chủ và chạy lại.",
+                404,
+            )
         zip_path = job.get("zip_path")
         zip_name = job.get("zip_name") or "wallpapers.zip"
         tmp_dir = job.get("tmp_dir")
 
     if not zip_path or not os.path.isfile(zip_path):
-        return jsonify({"error": "File ZIP không còn."}), 404
+        return _download_gone_response(
+            "File ZIP không còn (có thể đã tải xong). Về trang chủ và tạo job mới nếu cần.",
+            404,
+        )
 
     @after_this_request
     def cleanup(resp):
