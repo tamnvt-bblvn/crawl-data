@@ -29,6 +29,8 @@ THEME_SUBDIR = "theme"
 # Wallpics sticker packs: API trả về data[] với sticker (path zip) + stickers[]
 WALLPICS_BACKEND_BASE = "https://backend.wallpics.app"
 STICKERS_SUBDIR = "stickers"
+# Theme iOS (Lutech): API trả về list[] trực tiếp, ảnh theo id.
+LUTECH_WALLPAPER_BASE = "https://theme-ios.lutech.one/themeios/wallpaper"
 try:
     DOWNLOAD_WORKERS = max(1, min(32, int(os.getenv("DOWNLOAD_WORKERS", "8"))))
 except ValueError:
@@ -83,6 +85,17 @@ def _unique_theme_folder(base_name: str, key: str, used: set) -> str:
             used.add(cand)
             return cand
         n += 1
+
+
+def _letters_only_folder_name(text: Any, fallback: str = "subject", max_len: int = 80) -> str:
+    """
+    Giữ lại chữ và khoảng trắng từ chuỗi đầu vào để làm tên thư mục.
+    Ví dụ: "💗Valentine 2026" -> "Valentine".
+    """
+    s = str(text or "")
+    kept = "".join(ch for ch in s if ch.isalpha() or ch.isspace())
+    kept = " ".join(kept.split())
+    return _sanitize_folder_name(kept or fallback, max_len=max_len)
 
 
 def parse_curl_command(curl_text: str) -> tuple[str, dict[str, str]]:
@@ -324,7 +337,15 @@ def unzip_all_under(
 
 
 def _detect_json_kind(data_json: Any) -> Optional[str]:
-    """ThemeKit | Sticker packs | Wallpics wallpaper list."""
+    """ThemeKit | Sticker packs | Wallpics wallpaper list | Lutech wallpaper list."""
+    if isinstance(data_json, list):
+        if data_json and isinstance(data_json[0], dict):
+            first = data_json[0]
+            # Theme iOS/Lutech: top-level list object, có id + subject.
+            if "id" in first and "subject" in first:
+                return "lutech_wallpapers"
+        return None
+
     if not isinstance(data_json, dict):
         return None
     d = data_json.get("data")
@@ -377,6 +398,31 @@ def _iter_download_tasks(data_json: dict, base_dir: str) -> list[tuple[str, str,
             u = item.get(key)
             if u:
                 tasks.append((u, wp_folder, new_name, wp_slug, 1))
+    return tasks
+
+
+def _iter_lutech_wallpaper_tasks(data_json: list[dict[str, Any]], base_dir: str) -> list[tuple[str, str, str, str]]:
+    """
+    Mỗi item sinh 2 task:
+    - thumbnail.webp: .../webp/wallpaper{id}.webp
+    - wallpaper.png: .../png/wallpaper{id}.png
+
+    Cấu trúc thư mục:
+    base_dir/<subject-chi-lay-chu>/<id>/{thumbnail.webp, wallpaper.png}
+    """
+    tasks: list[tuple[str, str, str, str]] = []
+    for item in data_json:
+        if not isinstance(item, dict):
+            continue
+        wallpaper_id = str(item.get("id") or "").strip()
+        if not wallpaper_id:
+            continue
+        subject_folder = _letters_only_folder_name(item.get("subject"), fallback="subject")
+        pair_folder = os.path.join(base_dir, subject_folder, wallpaper_id)
+        webp_url = f"{LUTECH_WALLPAPER_BASE}/webp/wallpaper{wallpaper_id}.webp"
+        png_url = f"{LUTECH_WALLPAPER_BASE}/png/wallpaper{wallpaper_id}.png"
+        tasks.append((webp_url, os.path.join(pair_folder, "thumbnail.webp"), f"{subject_folder}/{wallpaper_id}/thumbnail", subject_folder))
+        tasks.append((png_url, os.path.join(pair_folder, "wallpaper.png"), f"{subject_folder}/{wallpaper_id}/wallpaper", subject_folder))
     return tasks
 
 
@@ -603,6 +649,83 @@ def _download_wallpics_from_json(
     return result
 
 
+def _download_lutech_wallpapers_from_json(
+    data_json: list[dict[str, Any]],
+    base_dir: str,
+    progress_callback: Optional[Callable[[dict[str, Any]], None]],
+    result: dict,
+) -> dict:
+    def _p(payload: dict[str, Any]) -> None:
+        if progress_callback:
+            progress_callback(payload)
+
+    _p({"phase": "parse", "current": 0, "total": 0, "message": "Đang phân tích wallpaper list (Lutech)…"})
+    tasks = _iter_lutech_wallpaper_tasks(data_json, base_dir)
+    total = len(tasks)
+    if total == 0:
+        result["error"] = "Lutech wallpaper: không có item hợp lệ (thiếu id/subject)."
+        return result
+
+    result["kind"] = "lutech_wallpapers"
+    _p(
+        {
+            "phase": "download",
+            "current": 0,
+            "total": total,
+            "message": f"Tìm thấy {total} file (Lutech wallpaper: thumbnail.webp + wallpaper.png theo id).",
+        }
+    )
+
+    workers = _parallel_workers_for(total)
+    futures: dict = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for url, dest_path, label, subject_folder in tasks:
+            fut = executor.submit(download_url_to_file, url, dest_path)
+            futures[fut] = (label, subject_folder)
+
+        done = 0
+        for fut in as_completed(futures):
+            label, subject_folder = futures[fut]
+            try:
+                ok = bool(fut.result())
+            except Exception:
+                ok = False
+            if ok:
+                result["files_ok"] += 1
+            else:
+                result["files_fail"] += 1
+            done += 1
+            _p(
+                {
+                    "phase": "download",
+                    "current": done,
+                    "total": total,
+                    "message": f"Đã tải {done}/{total}: {label}" + (" ✓" if ok else " (lỗi/bỏ qua)"),
+                    "slug": subject_folder,
+                    "item": label,
+                }
+            )
+
+    if os.path.isdir(base_dir):
+        subject_folders = [
+            item for item in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, item))
+        ]
+        result["slug_count"] = len(subject_folders)
+    else:
+        result["slug_count"] = 0
+
+    result["ok"] = True
+    _p(
+        {
+            "phase": "download",
+            "current": total,
+            "total": total,
+            "message": f"Lutech wallpaper xong: {result['files_ok']} file OK, {result['files_fail']} lỗi/bỏ qua.",
+        }
+    )
+    return result
+
+
 def _download_themekit_from_json(
     data_json: dict,
     theme_root: str,
@@ -695,9 +818,9 @@ def download_resources(
     progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict:
     """
-    Gọi API, nhận diện ThemeKit / sticker packs / wallpaper Wallpics, tải về base_dir.
+    Gọi API, nhận diện ThemeKit / sticker packs / wallpaper Wallpics / wallpaper Lutech, tải về base_dir.
     ThemeKit: base_dir/theme/… | Sticker: base_dir/stickers/… | Wallpaper: slug trực tiếp dưới base_dir.
-    Trả về: ok, slug_count, files_ok, files_fail, error, kind ('wallpics'|'themekit'|'stickers').
+    Trả về: ok, slug_count, files_ok, files_fail, error, kind.
     """
     if not os.path.exists(base_dir):
         os.makedirs(base_dir)
@@ -744,9 +867,12 @@ def download_resources(
         if kind == "wallpics":
             return _download_wallpics_from_json(data_json, base_dir, progress_callback, result)
 
+        if kind == "lutech_wallpapers":
+            return _download_lutech_wallpapers_from_json(data_json, base_dir, progress_callback, result)
+
         result["error"] = (
             "Không nhận dạng JSON (Wallpics wallpaper list; ThemeKit data.categoryList; "
-            "Sticker packs data[] có sticker + stickers)."
+            "Sticker packs data[] có sticker + stickers; Lutech list[] có id + subject)."
         )
         return result
     except Exception as e:
