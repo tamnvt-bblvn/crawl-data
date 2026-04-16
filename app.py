@@ -413,13 +413,17 @@ PAGE = """
 
   function triggerDownload(jobId, zipName) {
     var fallbackName = zipName || "wallpapers.zip";
+    statsLine.textContent =
+      "Đang lấy file ZIP từ server… (đừng reload tab cho đến khi trình duyệt bắt đầu lưu file)";
     fetch("/api/download/" + jobId)
       .then(function(r) {
         if (!r.ok) {
           return r.text().then(function() {
-            throw new Error(
-              "ZIP chỉ tải được một lần — nếu đã tải hoặc đã reload trang, hãy chạy lại bước tải trên trang chủ."
-            );
+            var msg =
+              r.status === 404
+                ? "Không còn file ZIP để tải (thường do đã tải xong, đã reload trang, hoặc mở lại link cũ). Về trang chủ và chạy lại bước tải."
+                : "Lỗi tải ZIP (HTTP " + r.status + "). Thử lại từ trang chủ.";
+            throw new Error(msg);
           });
         }
         var ct = (r.headers.get("Content-Type") || "").toLowerCase();
@@ -443,6 +447,7 @@ PAGE = """
         a.click();
         a.remove();
         URL.revokeObjectURL(url);
+        statsLine.textContent = "Đã gửi file ZIP xuống máy — kiểm tra thư mục Downloads.";
       })
       .catch(function(e) {
         parseErr.textContent = e.message || String(e);
@@ -540,7 +545,12 @@ PAGE = """
             autoDownloadDone = true;
             btn.disabled = false;
             btn.textContent = "Bắt đầu tải & tạo ZIP";
-            setStatus("ok", "Hoàn tất");
+            setStatus("ok", "ZIP đã sẵn sàng");
+            statsLine.textContent =
+              "ZIP trên server đã tạo xong — đang bắt đầu tải xuống trình duyệt (mỗi job chỉ tải được một lần).";
+            logLine(
+              "Giai đoạn nén ZIP xong. Tiếp theo: tải file về máy — không đóng/reload tab cho đến khi file bắt đầu lưu."
+            );
             setBar(1, 1);
             var kind = p.kind || "wallpics";
             var folderLine = kind === "themekit"
